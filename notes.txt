@@ -1,0 +1,149 @@
+created a folder in same lvl as snnparallel. named dc_learning
+
+this is what it has now:
+
+
+dev@gopi-eda dc_learning]$ ls
+outputs  reports  rtl  scripts  work
+
+
+[dev@gopi-eda dc_learning]$ ls -R
+.:
+outputs  reports  rtl  scripts  work
+
+./outputs:
+
+./reports:
+
+./rtl:
+adder4.sv
+
+./scripts:
+
+./work:
+
+
+this is my rtl now, adder4.sv: assign {cout, sum} = a + b + cin;
+
+this is behavioral, dc will turn it into actual gates using the 45nm library
+
+a simulator like iverilog just evaluates the + operator but doesnt know how its in silicon
+
+synthesis is the translation from intern -> physical gates
+
+rtl
+|
+▼
+setup
+
+so first step would be to access which technology node you are gonna target
+
+load target library--> .db ---> 45nm cells
+
+
+
+|
+▼
+compilation (analyze/elaborate)
+
+reads the code checks syntax builds an internal representation called gtech generic technology
+gtech has real logic AND OR FF, but no real cells no 45nm yet
+its tech independent
+
+
+
+cat > /scratch1/dev/parallelsparse/tb/shared_S005_stimulus_k1024.vh << 'EOF'
+// shared_S005_stimulus_k1024.vh
+integer cycle, i, ch;
+integer seed = 32'hABCD1234;
+integer sparsity = 5;
+
+initial begin
+    repeat(5) @(posedge clk);
+    
+    for (cycle = 0; cycle < 50; cycle = cycle + 1) begin
+        @(negedge clk);
+        
+        // 1024-bit Bitmasks
+        for (i = 0; i < 1024; i = i + 1) begin
+            shared_bitmask_a[i] = ($unsigned($dist_uniform(seed, 0, 99)) >= sparsity);
+            shared_bitmask_b[i] = ($unsigned($dist_uniform(seed, 0, 99)) >= sparsity);
+        end
+        
+        // 8192-bit Weights
+        for (ch = 0; ch < 1024; ch = ch + 1) begin
+            if ($unsigned($dist_uniform(seed, 0, 99)) < sparsity)
+                shared_b_flat[ch*8 +: 8] = 8'h00;
+            else
+                shared_b_flat[ch*8 +: 8] = $dist_uniform(seed, 0, 255);
+        end
+        
+        // 1024-bit Activations
+        for (i = 0; i < 1024; i = i + 1) begin
+            shared_a_flat[i*8 +: 8] = $dist_uniform(seed, 0, 255);
+        end
+        
+        valid_in = 1;
+    end
+    
+    @(negedge clk);
+    valid_in = 0;
+    repeat(15) @(posedge clk);
+    
+    $dumpoff;
+    $finish;
+end
+EOF
+
+sed -i 's|shared_S005_stimulus.vh|shared_S005_stimulus_k1024.vh|' /scratch1/dev/parallelsparse/tb/tb_power_ann.sv
+
+cat > /scratch1/dev/parallelsparse/ann_sweep_k1024.sh << 'EOF'
+#!/bin/bash
+
+TB_DIR="/scratch1/dev/parallelsparse/tb"
+WORK_DIR="/scratch1/dev/parallelsparse/annparallel/work"
+RESULTS_DIR="/scratch1/dev/parallelsparse/k1024_ann_results"
+STIMULUS="$TB_DIR/shared_S005_stimulus_k1024.vh"
+
+mkdir -p "$RESULTS_DIR"
+
+sparsities=(5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95)
+
+for s in "${sparsities[@]}"; do
+    echo "--- Running ANN (K1024) at $s% sparsity ---"
+
+    sed -i "s/integer sparsity = [0-9]*/integer sparsity = $s/" "$STIMULUS"
+
+    cd "$WORK_DIR"
+    iverilog -g2012 -o ann_sim_k1024 ../rtl/ann_core.sv "$TB_DIR/tb_power_ann.sv"
+    vvp ann_sim_k1024
+
+    mv ann_S005.vcd "$RESULTS_DIR/ann_k1024_S${s}.vcd"
+
+    vcd2saif \
+        -input "$RESULTS_DIR/ann_k1024_S${s}.vcd" \
+        -output "$RESULTS_DIR/ann_k1024_S${s}.saif"
+
+    cat > run_ann_k1024.tcl << TCLEOF
+reset_design
+source ../top_settings.tcl
+source ../scripts/mount.tcl
+source ../scripts/path.tcl
+read_ddc ../outputs_ann_core/ann_core.incr_compile.ddc
+current_design ann_core
+read_saif -input "$RESULTS_DIR/ann_k1024_S${s}.saif" -instance_name tb_power_ann/dut
+report_power -hierarchy > "$RESULTS_DIR/ANN_K1024_S${s}.power.rpt"
+exit
+TCLEOF
+
+    design_vision -no_gui -f run_ann_k1024.tcl
+
+    echo "Done $s%:"
+    grep "ann_core " "$RESULTS_DIR/ANN_K1024_S${s}.power.rpt" | tail -1
+done
+EOF
+
+chmod +x /scratch1/dev/parallelsparse/ann_sweep_k1024.sh
+bash /scratch1/dev/parallelsparse/ann_sweep_k1024.sh
+
+
